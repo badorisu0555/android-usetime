@@ -1,0 +1,436 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Transform": "AWS::Serverless-2016-10-31",
+  "Description": "childcare-info: Lambda1(毎朝コンテンツ生成・LINE配信) + Lambda2(LINE postback受信) + DynamoDB + CloudWatch Alarms",
+  "Parameters": {
+    "ProjectName": {
+      "Type": "String",
+      "Default": "childcare-info"
+    },
+    "DeliveryScheduleExpression": {
+      "Type": "String",
+      "Default": "cron(0 22 * * ? *)",
+      "Description": "Lambda1の実行スケジュール(UTC)。デフォルトは毎朝7時JST"
+    },
+    "AlertEmail": {
+      "Type": "String",
+      "Description": "CloudWatchアラーム通知を受け取るメールアドレス"
+    }
+  },
+  "Resources": {
+    "Table1": {
+      "Type": "AWS::DynamoDB::Table",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "TableName": "childcare-info-table1-deliverycontent",
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          { "AttributeName": "delivery_id", "AttributeType": "S" },
+          { "AttributeName": "user_id", "AttributeType": "S" },
+          { "AttributeName": "delivered_at", "AttributeType": "S" }
+        ],
+        "KeySchema": [
+          { "AttributeName": "delivery_id", "KeyType": "HASH" }
+        ],
+        "GlobalSecondaryIndexes": [
+          {
+            "IndexName": "GSI1",
+            "KeySchema": [
+              { "AttributeName": "user_id", "KeyType": "HASH" },
+              { "AttributeName": "delivered_at", "KeyType": "RANGE" }
+            ],
+            "Projection": {
+              "ProjectionType": "INCLUDE",
+              "NonKeyAttributes": ["category", "summary", "score"]
+            }
+          }
+        ],
+        "TimeToLiveSpecification": {
+          "AttributeName": "ttl",
+          "Enabled": true
+        }
+      }
+    },
+    "Table2": {
+      "Type": "AWS::DynamoDB::Table",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "TableName": "childcare-info-table2-userprofile",
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          { "AttributeName": "user_id", "AttributeType": "S" }
+        ],
+        "KeySchema": [
+          { "AttributeName": "user_id", "KeyType": "HASH" }
+        ],
+        "TimeToLiveSpecification": {
+          "AttributeName": "ttl",
+          "Enabled": true
+        }
+      }
+    },
+    "Table3": {
+      "Type": "AWS::DynamoDB::Table",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "TableName": "childcare-info-table3-categoryscore",
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          { "AttributeName": "user_id", "AttributeType": "S" }
+        ],
+        "KeySchema": [
+          { "AttributeName": "user_id", "KeyType": "HASH" }
+        ],
+        "TimeToLiveSpecification": {
+          "AttributeName": "ttl",
+          "Enabled": true
+        }
+      }
+    },
+
+    "Lambda1ExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": { "Fn::Sub": "${ProjectName}-deliver-contents-role" },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [{ "Effect": "Allow", "Principal": { "Service": "lambda.amazonaws.com" }, "Action": "sts:AssumeRole" }]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+        "Policies": [
+          {
+            "PolicyName": "DynamoDBAccessPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": ["dynamodb:Query", "dynamodb:PutItem"],
+                  "Resource": [
+                    { "Fn::GetAtt": ["Table1", "Arn"] },
+                    { "Fn::Sub": ["${TableArn}/index/GSI1", { "TableArn": { "Fn::GetAtt": ["Table1", "Arn"] } }] }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["dynamodb:GetItem"],
+                  "Resource": [
+                    { "Fn::GetAtt": ["Table2", "Arn"] },
+                    { "Fn::GetAtt": ["Table3", "Arn"] }
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "PolicyName": "SsmParameterAccessPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": ["ssm:GetParameter"],
+                  "Resource": [
+                    { "Fn::Sub": "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/childcare-info/CLAUDE_API_KEY" },
+                    { "Fn::Sub": "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/childcare-info/LINE_USER_ID" },
+                    { "Fn::Sub": "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/childcare-info/LINE_CHANNEL_ACCESS_TOKEN" }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["kms:Decrypt"],
+                  "Resource": "*",
+                  "Condition": {
+                    "StringEquals": { "kms:ViaService": { "Fn::Sub": "ssm.${AWS::Region}.amazonaws.com" } }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+
+    "Lambda2ExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": { "Fn::Sub": "${ProjectName}-line-webhook-role" },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [{ "Effect": "Allow", "Principal": { "Service": "lambda.amazonaws.com" }, "Action": "sts:AssumeRole" }]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+        "Policies": [
+          {
+            "PolicyName": "DynamoDBAccessPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": ["dynamodb:UpdateItem"],
+                  "Resource": [
+                    { "Fn::GetAtt": ["Table1", "Arn"] },
+                    { "Fn::GetAtt": ["Table3", "Arn"] }
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "PolicyName": "SsmParameterAccessPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": ["ssm:GetParameter"],
+                  "Resource": [
+                    { "Fn::Sub": "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/childcare-info/LINE_CHANNEL_SECRET" }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["kms:Decrypt"],
+                  "Resource": "*",
+                  "Condition": {
+                    "StringEquals": { "kms:ViaService": { "Fn::Sub": "ssm.${AWS::Region}.amazonaws.com" } }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+
+    "Lambda1LogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": { "Fn::Sub": "/aws/lambda/${ProjectName}-deliver-contents" },
+        "RetentionInDays": 30
+      }
+    },
+
+    "Lambda1Function": {
+      "Type": "AWS::Serverless::Function",
+      "Properties": {
+        "FunctionName": { "Fn::Sub": "${ProjectName}-deliver-contents" },
+        "CodeUri": "../app/deliver_contents/",
+        "Handler": "main.lambda_handler",
+        "Runtime": "python3.12",
+        "Timeout": 120,
+        "MemorySize": 512,
+        "Role": { "Fn::GetAtt": ["Lambda1ExecutionRole", "Arn"] }
+      },
+      "DependsOn": ["Lambda1LogGroup"]
+    },
+
+    "Lambda1ScheduleRule": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "Name": { "Fn::Sub": "${ProjectName}-deliver-contents-schedule" },
+        "Description": "Lambda1(コンテンツ生成・LINE配信)を毎朝起動する",
+        "ScheduleExpression": { "Ref": "DeliveryScheduleExpression" },
+        "State": "ENABLED",
+        "Targets": [
+          {
+            "Id": "Lambda1Target",
+            "Arn": { "Fn::GetAtt": ["Lambda1Function", "Arn"] }
+          }
+        ]
+      }
+    },
+
+    "Lambda1ScheduleRulePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": { "Ref": "Lambda1Function" },
+        "Principal": "events.amazonaws.com",
+        "SourceArn": { "Fn::GetAtt": ["Lambda1ScheduleRule", "Arn"] }
+      }
+    },
+
+    "LineBotSdkLayer": {
+      "Type": "AWS::Serverless::LayerVersion",
+      "Properties": {
+        "LayerName": { "Fn::Sub": "${ProjectName}-line-bot-sdk" },
+        "ContentUri": "../line-bot-sdk-layer/",
+        "CompatibleRuntimes": ["python3.12"],
+        "RetentionPolicy": "Delete"
+      }
+    },
+
+    "Lambda2LogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": { "Fn::Sub": "/aws/lambda/${ProjectName}-line-webhook" },
+        "RetentionInDays": 30
+      }
+    },
+
+    "Lambda2Function": {
+      "Type": "AWS::Serverless::Function",
+      "Properties": {
+        "FunctionName": { "Fn::Sub": "${ProjectName}-line-webhook" },
+        "CodeUri": "../app/line_webhook/",
+        "Handler": "postback.lambda_handler",
+        "Runtime": "python3.12",
+        "Timeout": 10,
+        "MemorySize": 256,
+        "Role": { "Fn::GetAtt": ["Lambda2ExecutionRole", "Arn"] },
+        "Layers": [{ "Ref": "LineBotSdkLayer" }]
+      },
+      "DependsOn": ["Lambda2LogGroup"]
+    },
+
+    "Lambda2FunctionUrl": {
+      "Type": "AWS::Lambda::Url",
+      "Properties": {
+        "TargetFunctionArn": { "Ref": "Lambda2Function" },
+        "AuthType": "NONE"
+      }
+    },
+
+    "Lambda2FunctionUrlPublicPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName": { "Ref": "Lambda2Function" },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Principal": "*",
+        "FunctionUrlAuthType": "NONE"
+      }
+    },
+
+    "AlertTopic": {
+      "Type": "AWS::SNS::Topic",
+      "Properties": {
+        "TopicName": { "Fn::Sub": "${ProjectName}-alerts" }
+      }
+    },
+    "AlertSubscription": {
+      "Type": "AWS::SNS::Subscription",
+      "Properties": {
+        "TopicArn": { "Ref": "AlertTopic" },
+        "Protocol": "email",
+        "Endpoint": { "Ref": "AlertEmail" }
+      }
+    },
+
+    "DynamoReadFailedMetricFilter": {
+      "Type": "AWS::Logs::MetricFilter",
+      "Properties": {
+        "LogGroupName": { "Ref": "Lambda1LogGroup" },
+        "FilterPattern": "\"[ALARM:DYNAMO_READ_FAILED]\"",
+        "MetricTransformations": [
+          {
+            "MetricValue": "1",
+            "DefaultValue": 0,
+            "MetricNamespace": "ChildcareInfo/Alarms",
+            "MetricName": "DynamoReadFailed"
+          }
+        ]
+      }
+    },
+    "DynamoWriteFailedMetricFilter": {
+      "Type": "AWS::Logs::MetricFilter",
+      "Properties": {
+        "LogGroupName": { "Ref": "Lambda1LogGroup" },
+        "FilterPattern": "\"[ALARM:DYNAMO_WRITE_FAILED]\"",
+        "MetricTransformations": [
+          {
+            "MetricValue": "1",
+            "DefaultValue": 0,
+            "MetricNamespace": "ChildcareInfo/Alarms",
+            "MetricName": "DynamoWriteFailed"
+          }
+        ]
+      }
+    },
+    "LineDeliveryFailedMetricFilter": {
+      "Type": "AWS::Logs::MetricFilter",
+      "Properties": {
+        "LogGroupName": { "Ref": "Lambda1LogGroup" },
+        "FilterPattern": "\"[ALARM:LINE_DELIVERY_FAILED]\"",
+        "MetricTransformations": [
+          {
+            "MetricValue": "1",
+            "DefaultValue": 0,
+            "MetricNamespace": "ChildcareInfo/Alarms",
+            "MetricName": "LineDeliveryFailed"
+          }
+        ]
+      }
+    },
+
+    "DynamoReadFailedAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "DependsOn": ["DynamoReadFailedMetricFilter"],
+      "Properties": {
+        "AlarmName": { "Fn::Sub": "${ProjectName}-dynamo-read-failed" },
+        "AlarmDescription": "DynamoDBの読み取りに失敗し、その日の配信がスキップされた",
+        "Namespace": "ChildcareInfo/Alarms",
+        "MetricName": "DynamoReadFailed",
+        "Statistic": "Sum",
+        "Period": 3600,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [{ "Ref": "AlertTopic" }]
+      }
+    },
+    "DynamoWriteFailedAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "DependsOn": ["DynamoWriteFailedMetricFilter"],
+      "Properties": {
+        "AlarmName": { "Fn::Sub": "${ProjectName}-dynamo-write-failed" },
+        "AlarmDescription": "DynamoDBへの書き込みに失敗した(LINE配信自体は継続している)",
+        "Namespace": "ChildcareInfo/Alarms",
+        "MetricName": "DynamoWriteFailed",
+        "Statistic": "Sum",
+        "Period": 3600,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [{ "Ref": "AlertTopic" }]
+      }
+    },
+    "LineDeliveryFailedAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "DependsOn": ["LineDeliveryFailedMetricFilter"],
+      "Properties": {
+        "AlarmName": { "Fn::Sub": "${ProjectName}-line-delivery-failed" },
+        "AlarmDescription": "LINE配信(push API呼び出し)に失敗した",
+        "Namespace": "ChildcareInfo/Alarms",
+        "MetricName": "LineDeliveryFailed",
+        "Statistic": "Sum",
+        "Period": 3600,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [{ "Ref": "AlertTopic" }]
+      }
+    }
+  },
+  "Outputs": {
+    "Lambda2FunctionUrlOutput": {
+      "Description": "LINE Developersコンソールで手動登録するWebhook URL",
+      "Value": { "Fn::GetAtt": ["Lambda2FunctionUrl", "FunctionUrl"] }
+    },
+    "AlertTopicArn": {
+      "Description": "CloudWatchアラーム通知先のSNSトピック",
+      "Value": { "Ref": "AlertTopic" }
+    }
+  }
+}

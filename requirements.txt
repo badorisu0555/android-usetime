@@ -1,0 +1,19 @@
+# Base libraries
+pandas
+numpy
+ipykernel
+python-dotenv
+
+
+# AWS libraries
+boto3
+
+# API libraries
+fastapi
+uvicorn
+
+# Testing libraries
+pytest
+
+# project libraries
+pyjnius

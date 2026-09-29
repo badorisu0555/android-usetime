@@ -1,0 +1,4 @@
+requests
+langchain_core
+anthropic
+python-dateutil
